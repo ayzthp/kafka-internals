@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kafka write path</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f5f2;
+      --fg: #1c1b19;
+      --muted: #5e5a54;
+      --line: #d9d4cc;
+      --card: #fff;
+      --accent: #1f4fd8;
+      --accent-ink: #fff;
+      --p0: #1f4fd8;
+      --p1: #0f6e56;
+      --p2: #8a4b08;
+      --soft: #efece6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161615;
+        --fg: #f3f0ea;
+        --muted: #b3aea6;
+        --line: #33302c;
+        --card: #1e1d1b;
+        --accent: #8eabff;
+        --accent-ink: #12141c;
+        --p0: #8eabff;
+        --p1: #7dcea0;
+        --p2: #e0b15a;
+        --soft: #262421;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 16px/1.45 system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    main { max-width: 980px; margin: 0 auto; padding: 28px 20px 64px; }
+    h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 8px; }
+    h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
+    p { margin: 0; color: var(--muted); }
+    .lead { max-width: 62ch; margin-bottom: 22px; }
+    form, .path, .logs, .note {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding: 14px; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+    input {
+      font: inherit; color: inherit; background: var(--bg);
+      border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-width: 0;
+    }
+    label.key input { width: 140px; }
+    label.val { flex: 1; }
+    label.val input { width: 100%; }
+    button {
+      font: inherit; font-weight: 600; border: 0; border-radius: 6px;
+      background: var(--accent); color: var(--accent-ink); padding: 9px 14px; cursor: pointer;
+    }
+    button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+    .path { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 14px 0; padding: 12px; }
+    .step { padding: 8px 10px; border-radius: 8px; background: var(--soft); }
+    .step strong { display: block; font-size: 13px; }
+    .step span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .step.on { outline: 2px solid var(--accent); }
+    .logs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; overflow: hidden; }
+    .part { padding: 12px; min-height: 220px; }
+    .part + .part { border-left: 1px solid var(--line); }
+    .part header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+    .part header b { font-size: 14px; }
+    .swatch { width: 8px; height: 8px; border-radius: 99px; display: inline-block; margin-right: 6px; }
+    .p0 { color: var(--p0); background: var(--p0); }
+    .p1 { color: var(--p1); background: var(--p1); }
+    .p2 { color: var(--p2); background: var(--p2); }
+    .rec {
+      display: grid; grid-template-columns: auto 1fr; gap: 8px;
+      padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px;
+    }
+    .rec em { font-style: normal; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .empty { color: var(--muted); font-size: 13px; }
+    .math { margin: 14px 0; font-size: 14px; }
+    .math code, .note code { font-family: ui-monospace, monospace; font-size: 0.92em; }
+    .note { padding: 12px 14px; margin-top: 14px; }
+    .note p + p { margin-top: 8px; }
+    @media (max-width: 720px) {
+      .path, .logs { grid-template-columns: 1fr; }
+      .part + .part { border-left: 0; border-top: 1px solid var(--line); }
+      label.val { flex-basis: 100%; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>One append, one partition</h1>
+  <p class="lead">A topic is three logs here. The key picks the log. The offset is just the next slot in that log. Followers and the high watermark sit under the logs: a consumer is only allowed to read a record after every in-sync replica has it.</p>
+
+  <form id="produce-form">
+    <label class="key">Key
+      <input id="key" name="key" value="alice" autocomplete="off" />
+    </label>
+    <label class="val">Value
+      <input id="value" name="value" value='{"event":"add_to_cart"}' autocomplete="off" />
+    </label>
+    <button type="submit">Append</button>
+    <button type="button" class="ghost" id="clear">Clear logs</button>
+  </form>
+
+  <p class="math" id="math" role="status"></p>
+
+  <section class="path" aria-label="Write path">
+    <div class="step" data-step="0"><strong>Batch</strong><span>Producer holds records, then sends a batch.</span></div>
+    <div class="step" data-step="1"><strong>Partition</strong><span>murmur2(key) picks the leader.</span></div>
+    <div class="step" data-step="2"><strong>Append</strong><span>Leader writes the next offset.</span></div>
+    <div class="step" data-step="3"><strong>High watermark</strong><span>Visible once the ISR has it.</span></div>
+  </section>
+
+  <section class="logs" aria-label="Partitions">
+    <div class="part" id="part-0"></div>
+    <div class="part" id="part-1"></div>
+    <div class="part" id="part-2"></div>
+  </section>
+
+  <section class="note">
+    <h2>What the cluster adds</h2>
+    <p>This page is one broker's worth of logs. In the Compose cluster each partition has a leader and two followers. <code>acks=all</code> returns only after the in-sync replicas append the same batch. The high watermark is that agreed offset. Consumers do not read past it.</p>
+    <p>Leave the key blank and the record uses the sticky partitioner: several unkeyed records share one partition, then the producer switches. A key does not stick by accident. It is <code>toPositive(murmur2(key)) % 3</code>, the same function the Java client uses. Try <code>alice</code> twice.</p>
+  </section>
+</main>
+<script>
+  const PARTS = 3;
+  const logs = [[], [], []];
+  let sticky = 0;
+  let stickyLeft = 0;
+
+  function murmur2(str) {
+    const data = new TextEncoder().encode(str);
+    const length = data.length;
+    const seed = 0x9747b28c;
+    const m = 0x5bd1e995;
+    const r = 24;
+    let h = (seed ^ length) | 0;
+    const length4 = (length / 4) | 0;
+    for (let i = 0; i < length4; i++) {
+      const i4 = i * 4;
+      let k = (data[i4] & 0xff) + ((data[i4 + 1] & 0xff) << 8) + ((data[i4 + 2] & 0xff) << 16) + ((data[i4 + 3] & 0xff) << 24);
+      k = Math.imul(k, m);
+      k ^= k >>> r;
+      k = Math.imul(k, m);
+      h = Math.imul(h, m);
+      h ^= k;
+    }
+    const rem = length & ~3;
+    switch (length % 4) {
+      case 3: h ^= (data[rem + 2] & 0xff) << 16;
+      case 2: h ^= (data[rem + 1] & 0xff) << 8;
+      case 1:
+        h ^= data[rem] & 0xff;
+        h = Math.imul(h, m);
+    }
+    h ^= h >>> 13;
+    h = Math.imul(h, m);
+    h ^= h >>> 15;
+    return h | 0;
+  }
+
+  function toPositive(n) { return n & 0x7fffffff; }
+
+  function choose(key) {
+    if (key.length === 0) {
+      if (stickyLeft <= 0) {
+        sticky = (sticky + 1) % PARTS;
+        stickyLeft = 3;
+      }
+      stickyLeft -= 1;
+      return { partition: sticky, how: "no key, sticky partitioner, batch of 3" };
+    }
+    const hash = murmur2(key);
+    const positive = toPositive(hash);
+    return {
+      partition: positive % PARTS,
+      how: "toPositive(murmur2(\"" + key + "\")) = " + positive + " → partition " + (positive % PARTS)
+    };
+  }
+
+  function render(active) {
+    for (let p = 0; p < PARTS; p++) {
+      const el = document.getElementById("part-" + p);
+      const items = logs[p].map(function (rec) {
+        return '<div class="rec"><em>offset ' + rec.offset + '</em><span>' + rec.keyLabel + " " + rec.value + "</span></div>";
+      }).join("");
+      el.innerHTML =
+        '<header><b><i class="swatch p' + p + '"></i>Partition ' + p + '</b><span>' + logs[p].length + (logs[p].length === 1 ? ' record' : ' records') + '</span></header>' +
+        (items || '<div class="empty">No records yet.</div>');
+    }
+    document.querySelectorAll(".step").forEach(function (step) {
+      step.classList.toggle("on", Number(step.dataset.step) === active);
+    });
+  }
+
+  function flash() {
+    let i = 0;
+    render(0);
+    const timer = setInterval(function () {
+      i += 1;
+      render(i);
+      if (i >= 3) clearInterval(timer);
+    }, 180);
+  }
+
+  document.getElementById("produce-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    const key = document.getElementById("key").value.trim();
+    const value = document.getElementById("value").value.trim() || "(empty)";
+    const choice = choose(key);
+    const partition = choice.partition;
+    const offset = logs[partition].length;
+    logs[partition].push({
+      offset: offset,
+      keyLabel: key.length ? key : "(null key)",
+      value: value
+    });
+    document.getElementById("math").textContent =
+      (key.length ? "Key " + key + ". " : "No key. ") + choice.how + ". Leader appends offset " + offset + ".";
+    flash();
+  });
+
+  document.getElementById("clear").addEventListener("click", function () {
+    logs[0] = []; logs[1] = []; logs[2] = [];
+    document.getElementById("math").textContent = "Logs cleared. Offsets start at 0 again because this page is the whole cluster.";
+    render(-1);
+  });
+
+  document.getElementById("math").textContent = "Append alice. She will hash to the same partition every time.";
+  render(-1);
+</script>
+</body>
+</html>
